@@ -18,3 +18,15 @@ A real-time data streaming pipeline designed to ingest stock market trades, dete
 * Collaboratively designed the end-to-end streaming architecture.
 * Researched circuit-breaker logic parameters and thresholds.
 * Finalized initial PostgreSQL schema for trade ingestion and alert logging.
+
+* ## Proposed System Pipeline (Under Research)
+
+```mermaid
+flowchart TD
+    A[Mock / Live Market Feed<br><i>Python Generator</i>] -->|Streaming JSON Ticks| B[Message Broker<br><i>Apache Kafka: 'stock-ticks'</i>]
+    B -->|Subscribe & Stream| C[Stream Processing Engine<br><i>Python Volatility Tracker</i>]
+    C -->|Breach Threshold Detected| D[Alerting Engine<br><i>Circuit Breaker Log / Console</i>]
+    C -->|Persist Trade Data| E[(Relational Database<br><i>PostgreSQL</i>)]
+    D -->|Log Trigger Events| E
+    E -->|Read Query / Aggregate| F[Analytics Dashboard<br><i>PowerBI / Apache Superset</i>]
+```
