@@ -29,7 +29,7 @@ A real-time data streaming pipeline designed to ingest stock market trades, dete
 
 ---
 
-## 🏗️ Proposed System Pipeline (Under Research)
+## Proposed System Pipeline (Under Research)
 
 ```mermaid
 flowchart TD
@@ -39,7 +39,8 @@ flowchart TD
     C -->|Persist Trade Data| E[("Relational Database (PostgreSQL)")]
     D -->|Log Trigger Events| E
     E -->|Read Query / Aggregate| F["Analytics Dashboard (PowerBI / Streamlit)"]
----
+
+
 
 📚 Academic References & Theoretical Foundations
 This project grounds its real-time streaming architecture and risk mechanics in established academic literature:
@@ -67,3 +68,4 @@ Time-Series Relational Persistence:
 Stonebraker, M., et al. "Benchmarking Streaming Data Ingestion in Relational Systems." ACM SIGMOD.
 
 Focus: Mitigating write-lock overhead during continuous streaming ingestion into relational stores (PostgreSQL).
+
