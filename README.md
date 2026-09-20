@@ -39,33 +39,26 @@ flowchart TD
     C -->|Persist Trade Data| E[("Relational Database (PostgreSQL)")]
     D -->|Log Trigger Events| E
     E -->|Read Query / Aggregate| F["Analytics Dashboard (PowerBI / Streamlit)"]
+```
 
+---
 
+## 📚 Academic References & Theoretical Foundations
 
-📚 Academic References & Theoretical Foundations
 This project grounds its real-time streaming architecture and risk mechanics in established academic literature:
 
-Distributed Event Streaming:
+1. **Distributed Event Streaming:**
+   * *Kreps, J., Narkhede, N., & Rao, J.* "Kafka: A Distributed Messaging System for Log Processing." *Proceedings of the 6th International Workshop on Networking Meets Databases (NetDB)*.
+   * *Focus:* High-throughput log-structured message brokers for zero-loss trade tick ingestion.
 
-Kreps, J., Narkhede, N., & Rao, J. "Kafka: A Distributed Messaging System for Log Processing." Proceedings of the 6th International Workshop on Networking Meets Databases (NetDB).
+2. **Stream Processing & Alert Thresholds:**
+   * *Chandramouli, B., Maier, D., & Goldstein, J.* "High-Performance Complex Event Processing over Financial Data Streams." *IEEE International Conference on Data Engineering (ICDE)*.
+   * *Focus:* Efficient sliding-window computation for real-time volatility tracking and circuit-breaker triggers.
 
-Focus: High-throughput log-structured message brokers for zero-loss trade tick ingestion.
+3. **Market Microstructure & Circuit-Breaker Policies:**
+   * *Subrahmanyam, A.* "Circuit Breakers and Market Volatility: A Survey." *Journal of Financial Markets*.
+   * *Focus:* Mechanisms of exchange cooling periods and automated price-band tripwires.
 
-Stream Processing & Alert Thresholds:
-
-Chandramouli, B., Maier, D., & Goldstein, J. "High-Performance Complex Event Processing over Financial Data Streams." IEEE International Conference on Data Engineering (ICDE).
-
-Focus: Efficient sliding-window computation for real-time volatility tracking and circuit-breaker triggers.
-
-Market Microstructure & Circuit-Breaker Policies:
-
-Subrahmanyam, A. "Circuit Breakers and Market Volatility: A Survey." Journal of Financial Markets.
-
-Focus: Mechanisms of exchange cooling periods and automated price-band tripwires.
-
-Time-Series Relational Persistence:
-
-Stonebraker, M., et al. "Benchmarking Streaming Data Ingestion in Relational Systems." ACM SIGMOD.
-
-Focus: Mitigating write-lock overhead during continuous streaming ingestion into relational stores (PostgreSQL).
-
+4. **Time-Series Relational Persistence:**
+   * *Stonebraker, M., et al.* "Benchmarking Streaming Data Ingestion in Relational Systems." *ACM SIGMOD*.
+   * *Focus:* Mitigating write-lock overhead during continuous streaming ingestion into relational stores (PostgreSQL).
