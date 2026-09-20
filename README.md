@@ -44,6 +44,9 @@ flowchart TD
     C -->|Persist Trade Data| E[("Relational Database (PostgreSQL)")]
     D -->|Log Trigger Events| E
     E -->|Read Query / Aggregate| F["Analytics Dashboard (PowerBI / Streamlit)"]
+```
+
+---
 
 ## 📚 Academic References & Theoretical Foundations
 
