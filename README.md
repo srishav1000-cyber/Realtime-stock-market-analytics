@@ -22,15 +22,15 @@ A real-time data streaming pipeline designed to ingest stock market trades, dete
 ## 🚀 Milestones Completed
 
 ### Week 1 Milestones Completed
-* Collaboratively designed the end-to-end streaming architecture[cite: 12].
-* Researched circuit-breaker logic parameters and thresholds[cite: 12].
-* Finalized initial PostgreSQL schema (`schema.sql`) for trade ingestion and alert logging[cite: 12].
+* Collaboratively designed the end-to-end streaming architecture.
+* Researched circuit-breaker logic parameters and thresholds.
+* Finalized initial PostgreSQL schema (`schema.sql`) for trade ingestion and alert logging.
 
 ### Week 2 Milestones Completed
-* Built a continuous tick simulator (`week2/nifty50_simulator.py`) generating live trade ticks (~2.5 ticks/sec) across 10 major NIFTY 50 equities[cite: 12].
-* Implemented in-stream percentage drift evaluation to trigger automated circuit-breaker alerts when price moves reach or exceed ±5%[cite: 12].
-* Developed an interactive dashboard (`week2/dashboard.py`) using Streamlit and Plotly with dynamic OHLC candlestick resampling (2s to 30s) and transaction volume bars[cite: 12].
-* Verified and documented execution runs locally via terminal and visualizer[cite: 12].
+* Built a continuous tick simulator (`week2/nifty50_simulator.py`) generating live trade ticks (~2.5 ticks/sec) across 10 major NIFTY 50 equities.
+* Implemented in-stream percentage drift evaluation to trigger automated circuit-breaker alerts when price moves reach or exceed ±5%.
+* Developed an interactive dashboard (`week2/dashboard.py`) using Streamlit and Plotly with dynamic OHLC candlestick resampling (2s to 30s) and transaction volume bars.
+* Verified and documented execution runs locally via terminal and visualizer.
 
 ---
 
