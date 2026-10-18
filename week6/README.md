@@ -1,4 +1,4 @@
-# UpCircuit — Angel One + Screener.in style trading terminal
+# UpCircuit — in style trading terminal
 
 Next.js 14 · Tailwind · TypeScript · TradingView Lightweight Charts · next-themes. Edge API routes, no native binaries (Vercel-ready).
 
