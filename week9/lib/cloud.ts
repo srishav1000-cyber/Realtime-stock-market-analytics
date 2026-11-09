@@ -1,0 +1,310 @@
+// Cloud persistence over Supabase PostgREST (plain fetch, no SDK). Every call carries the user's access token, so Row Level Security
+// (docs/PERSISTENCE_SCHEMA.sql) confines it to that user's rows. Saves are UPSERT-then-delete: a failed save never loses the previous data.
+import { sanitizeQuiet, validateQuiet, type QuietHours } from './quietHours';
+import type { Holding } from './types';
+import type { WatchlistState } from './watchlist';
+import { coerceAppRole, type AppRole } from './rbac';
+import type { RuleKind } from './alertRules';
+import type { DaemonBeat } from './feedHealth';
+
+export interface CloudConfig {
+  url: string;
+  anonKey: string;
+  getToken: () => Promise<string | null>;
+  fetch?: typeof fetch;
+  /** every REST call reports its outcome (drives the 🟢 Supabase Synced / 🟡 Local Cache Only badge) */
+  onResult?: (ok: boolean) => void;
+}
+/** Everything in `preferences.notify` (one jsonb blob, one sync path): alert channels + alarm sound + startup screen + density. */
+export type AlarmSound = 'default' | 'arpeggio';
+export type Landing = 'home' | 'terminal';
+export type Density = 'comfortable' | 'compact';
+export interface NotifyPrefs { push: boolean; email: boolean; audio: boolean; sound: AlarmSound; volume: number; landing: Landing; density: Density }
+export const DEFAULT_NOTIFY: NotifyPrefs = { push: false, email: true, audio: true, sound: 'default', volume: 1, landing: 'home', density: 'comfortable' };
+export interface PushSub { endpoint: string; keys: { p256dh: string; auth: string } }
+export interface AlertRow { symbol: string; direction: 'UPPER' | 'LOWER'; band: number; price: number; triggered_at: string }
+
+/* ───────────── pure row mapping (unit-tested) ───────────── */
+
+const SYM = /^[A-Za-z0-9&._-]{1,24}$/;
+const num = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? x : typeof x === 'string' && x.trim() !== '' && Number.isFinite(Number(x)) ? Number(x) : null);
+
+export function holdingsToRows(userId: string, holdings: Holding[], sectorOf?: (s: string) => string | undefined) {
+  const seen = new Set<string>();
+  const rows: { user_id: string; symbol: string; quantity: number; buy_price: number; sector: string | null }[] = [];
+  for (const h of holdings) {
+    const symbol = h.symbol.trim().toUpperCase();
+    if (!SYM.test(symbol) || seen.has(symbol) || !(h.qty > 0) || !(h.avg > 0)) continue; // un-priced demo rows (avg 0) are not user data
+    seen.add(symbol);
+    rows.push({ user_id: userId, symbol, quantity: h.qty, buy_price: h.avg, sector: sectorOf?.(symbol) ?? null });
+  }
+  return rows;
+}
+export function rowsToHoldings(rows: unknown): Holding[] {
+  if (!Array.isArray(rows)) return [];
+  const out: Holding[] = [];
+  for (const r of rows as Record<string, unknown>[]) {
+    const qty = num(r.quantity), avg = num(r.buy_price);
+    if (typeof r.symbol === 'string' && SYM.test(r.symbol) && qty && qty > 0 && avg && avg > 0) out.push({ symbol: r.symbol, qty, avg });
+  }
+  return out;
+}
+
+export function watchlistsToRows(userId: string, st: WatchlistState) {
+  const rows: { user_id: string; list_id: string; symbol: string; position: number }[] = [];
+  for (const l of st.lists) l.symbols.forEach((symbol, position) => { if (SYM.test(symbol)) rows.push({ user_id: userId, list_id: l.id, symbol, position }); });
+  return rows;
+}
+export const watchlistMeta = (st: WatchlistState) => ({ lists: st.lists.map((l) => ({ id: l.id, name: l.name })), active: st.active });
+/** Rebuild the app's WatchlistState from cloud rows + meta; null when the cloud holds nothing usable. */
+export function rowsToWatchlists(rows: unknown, meta: unknown): WatchlistState | null {
+  const m = meta as { lists?: unknown; active?: unknown } | null;
+  const lists: WatchlistState['lists'] = [];
+  if (m && Array.isArray(m.lists)) for (const l of m.lists as { id?: unknown; name?: unknown }[]) if (l && typeof l.id === 'string' && typeof l.name === 'string' && !lists.some((x) => x.id === l.id)) lists.push({ id: l.id, name: l.name, symbols: [] });
+  const byList = new Map<string, { symbol: string; position: number }[]>();
+  if (Array.isArray(rows)) for (const r of rows as Record<string, unknown>[]) if (typeof r.list_id === 'string' && typeof r.symbol === 'string' && SYM.test(r.symbol)) byList.set(r.list_id, [...(byList.get(r.list_id) ?? []), { symbol: r.symbol, position: num(r.position) ?? 0 }]);
+  for (const [id, items] of byList) if (!lists.some((l) => l.id === id)) lists.push({ id, name: id === 'main' ? 'Main' : id, symbols: [] });
+  if (!lists.length) return null;
+  for (const l of lists) l.symbols = (byList.get(l.id) ?? []).sort((a, b) => a.position - b.position).map((x) => x.symbol);
+  const active = m && typeof m.active === 'string' && lists.some((l) => l.id === m.active) ? (m.active as string) : lists[0].id;
+  return { lists, active };
+}
+
+export function parseNotify(x: unknown): NotifyPrefs {
+  const o = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>;
+  const D = DEFAULT_NOTIFY;
+  const vol = typeof o.volume === 'number' && Number.isFinite(o.volume) ? Math.min(1, Math.max(0.1, Math.round(o.volume * 100) / 100)) : D.volume;
+  return {
+    push: typeof o.push === 'boolean' ? o.push : D.push,
+    email: typeof o.email === 'boolean' ? o.email : D.email,
+    audio: typeof o.audio === 'boolean' ? o.audio : D.audio,
+    sound: o.sound === 'arpeggio' ? 'arpeggio' : D.sound,
+    volume: vol,
+    landing: o.landing === 'terminal' ? 'terminal' : D.landing,
+    density: o.density === 'compact' ? 'compact' : D.density,
+  };
+}
+
+/** PostgREST `in.(…)` list with each value double-quoted (symbols may contain & . -) */
+const enc = encodeURIComponent;
+export const inList = (vals: string[]) => `(${vals.map((v) => `"${v.replace(/"/g, '')}"`).join(',')})`;
+
+/* ───────────── REST client ───────────── */
+
+export interface CircuitEvent { id: string; symbol: string; direction: 'UPPER' | 'LOWER'; band: number; price: number; prev_close: number | null; trade_date: string; detected_at: string; source: string; status: 'open' | 'acknowledged' | 'escalated' | 'closed'; reviewed_by: string | null; reviewed_at: string | null; note: string | null }
+export interface AuditRow { seq: number; at: string; user_id: string | null; actor_role: string | null; action: string; entity: string | null; entity_id: string | null; meta: Record<string, unknown>; hash: string }
+export interface AdminUser { id: string; email: string | null; full_name: string | null; role: AppRole; created_at?: string }
+export interface AlertRuleRow { id: string; symbol: string; kind: RuleKind; threshold: number; cooldown_min: number; channels: { push?: boolean; email?: boolean }; enabled: boolean; last_triggered_at: string | null; created_at: string }
+export interface AlertDelivery { id: string; fired_at: string; symbol: string; kind: string; price: number | null; channel: string; status: string; detail: string | null; tick_time?: string | null; daemon_matched_at?: string | null; push_sent_at?: string | null; sw_ack_at?: string | null; displayed_at?: string | null }
+
+export interface AiSignoff { id: string; kind: string; symbol: string | null; model: string; prompt_version: string; data_used: string[]; output_hash: string; decision: 'approved' | 'rejected'; note: string | null; signer_role: string; signed_at: string }
+
+export interface DepthFlagRow { id: number; symbol: string; kind: 'wall' | 'add_cancel'; side: 'bid' | 'ask'; severity: 'watch' | 'elevated'; price: number | null; qty: number | null; detail: string; label: string; flagged_at: string }
+export interface VolumeBaselineRow { symbol: string; median_volume: number | null; sessions: number; status: 'ok' | 'insufficient' | 'unavailable'; computed_at: string }
+export type CloudClient = ReturnType<typeof createCloud>;
+const DELIVERY_COLS = 'id,fired_at,symbol,kind,price,channel,status,detail';
+const DELIVERY_LATENCY_COLS = 'tick_time,daemon_matched_at,push_sent_at,sw_ack_at,displayed_at';
+
+export function createCloud(cfg: CloudConfig) {
+  const base = cfg.url.replace(/\/+$/, '');
+  const f = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
+  async function call(path: string, init: { method?: string; body?: unknown; prefer?: string } = {}): Promise<unknown> {
+    const t = await cfg.getToken();
+    if (!t) throw new Error('not signed in');
+    const r = await f(`${base}/rest/v1/${path}`, {
+      method: init.method ?? 'GET',
+      headers: { apikey: cfg.anonKey, Authorization: `Bearer ${t}`, 'Content-Type': 'application/json', ...(init.prefer ? { Prefer: init.prefer } : {}) },
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+    }).catch((e) => { cfg.onResult?.(false); throw e; });
+    if (!r.ok) {
+      cfg.onResult?.(false);
+      const detail = await r.text().then((x) => (JSON.parse(x) as { message?: string }).message).catch(() => undefined);
+      throw new Error(`cloud ${r.status}${detail ? `: ${detail}` : ''}`);
+    }
+    cfg.onResult?.(true);
+    const txt = await r.text();
+    return txt ? JSON.parse(txt) : null;
+  }
+  const uid = (id: string) => `user_id=eq.${encodeURIComponent(id)}`;
+  return {
+    async loadPortfolio(userId: string): Promise<Holding[]> {
+      return rowsToHoldings(await call(`portfolios?${uid(userId)}&select=symbol,quantity,buy_price&order=created_at.asc`));
+    },
+    async savePortfolio(userId: string, holdings: Holding[], sectorOf?: (s: string) => string | undefined): Promise<void> {
+      const rows = holdingsToRows(userId, holdings, sectorOf);
+      if (rows.length) await call('portfolios?on_conflict=user_id,symbol', { method: 'POST', body: rows, prefer: 'resolution=merge-duplicates,return=minimal' });
+      const gone = rows.length ? `&symbol=not.in.${enc(inList(rows.map((r) => r.symbol)))}` : '';
+      await call(`portfolios?${uid(userId)}${gone}`, { method: 'DELETE', prefer: 'return=minimal' });
+    },
+    async loadWatchlists(userId: string): Promise<WatchlistState | null> {
+      const [rows, prefs] = await Promise.all([call(`watchlists?${uid(userId)}&select=list_id,symbol,position`), call(`preferences?${uid(userId)}&select=watchlist_meta`)]);
+      return rowsToWatchlists(rows, (prefs as { watchlist_meta?: unknown }[] | null)?.[0]?.watchlist_meta ?? null);
+    },
+    async saveWatchlists(userId: string, st: WatchlistState): Promise<void> {
+      const rows = watchlistsToRows(userId, st);
+      if (rows.length) await call('watchlists?on_conflict=user_id,list_id,symbol', { method: 'POST', body: rows, prefer: 'resolution=merge-duplicates,return=minimal' });
+      // remove (list, symbol) pairs that are gone: per list, delete symbols not in its current set; lists that no longer exist are dropped whole
+      for (const l of st.lists) {
+        const gone = l.symbols.length ? `&symbol=not.in.${enc(inList(l.symbols))}` : '';
+        await call(`watchlists?${uid(userId)}&list_id=eq.${encodeURIComponent(l.id)}${gone}`, { method: 'DELETE', prefer: 'return=minimal' });
+      }
+      await call(`watchlists?${uid(userId)}&list_id=not.in.${enc(inList(st.lists.map((l) => l.id)))}`, { method: 'DELETE', prefer: 'return=minimal' });
+      await call('preferences?on_conflict=user_id', { method: 'POST', body: [{ user_id: userId, watchlist_meta: watchlistMeta(st), updated_at: new Date().toISOString() }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+    async loadPrefs(userId: string): Promise<{ focus: string[] | null; notify: NotifyPrefs | null }> {
+      const r = ((await call(`preferences?${uid(userId)}&select=focus,notify`)) as { focus?: unknown; notify?: unknown }[] | null)?.[0];
+      if (!r) return { focus: null, notify: null };
+      return { focus: Array.isArray(r.focus) ? (r.focus as unknown[]).filter((x): x is string => typeof x === 'string') : null, notify: r.notify ? parseNotify(r.notify) : null };
+    },
+    async savePrefs(userId: string, p: { focus?: string[]; notify?: NotifyPrefs }): Promise<void> {
+      await call('preferences?on_conflict=user_id', { method: 'POST', body: [{ user_id: userId, ...(p.focus ? { focus: p.focus } : {}), ...(p.notify ? { notify: p.notify } : {}), updated_at: new Date().toISOString() }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+    /** Settings → Cloud & Data → "Reset cloud data": removes this account's portfolio, watchlists, preferences and alert history (profile and push devices stay) */
+    async resetAccountData(userId: string): Promise<void> {
+      for (const t of ['portfolios', 'watchlists', 'alert_history', 'preferences']) await call(`${t}?${uid(userId)}`, { method: 'DELETE', prefer: 'return=minimal' });
+    },
+    async logAlert(userId: string, a: Omit<AlertRow, 'triggered_at'> & { at?: number }): Promise<void> {
+      await call('alert_history', { method: 'POST', body: [{ user_id: userId, symbol: a.symbol, direction: a.direction, band: a.band, price: a.price, triggered_at: new Date(a.at ?? Date.now()).toISOString() }], prefer: 'return=minimal' });
+    },
+    async recentAlerts(userId: string, limit = 50): Promise<AlertRow[]> {
+      const rows = (await call(`alert_history?${uid(userId)}&select=symbol,direction,band,price,triggered_at&order=triggered_at.desc&limit=${limit}`)) as AlertRow[] | null;
+      return Array.isArray(rows) ? rows : [];
+    },
+    async savePushSubscription(userId: string, s: PushSub): Promise<void> {
+      await call('push_subscriptions?on_conflict=user_id,endpoint', { method: 'POST', body: [{ user_id: userId, endpoint: s.endpoint, keys: s.keys }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+    async deletePushSubscription(userId: string, endpoint: string): Promise<void> {
+      await call(`push_subscriptions?${uid(userId)}&endpoint=eq.${encodeURIComponent(endpoint)}`, { method: 'DELETE', prefer: 'return=minimal' });
+    },
+    async hasPushSubscription(userId: string, endpoint: string): Promise<boolean> {
+      const r = (await call(`push_subscriptions?${uid(userId)}&endpoint=eq.${encodeURIComponent(endpoint)}&select=id`)) as unknown[] | null;
+      return Array.isArray(r) && r.length > 0;
+    },
+    /* ── Week 8: roles, surveillance register, audit trail, alert rules (docs/ENTERPRISE_SCHEMA.sql) ── */
+    async loadRole(): Promise<AppRole> {
+      return coerceAppRole(await call('rpc/app_role', { method: 'POST', body: {} }));
+    },
+    async registerCircuit(e: { symbol: string; direction: 'UPPER' | 'LOWER'; band: number; price: number; prevClose: number; source: 'smartapi' | 'yahoo' | 'session' }): Promise<string | null> {
+      const r = await call('rpc/register_circuit_event', { method: 'POST', body: { p_symbol: e.symbol, p_direction: e.direction, p_band: e.band, p_price: e.price, p_prev_close: e.prevClose, p_source: e.source } });
+      return typeof r === 'string' ? r : null;
+    },
+    async listRegister(limit = 200): Promise<CircuitEvent[]> {
+      const r = await call(`circuit_events?select=*&order=detected_at.desc&limit=${limit}`);
+      return Array.isArray(r) ? (r as CircuitEvent[]) : [];
+    },
+    async reviewEvent(id: string, action: 'acknowledge' | 'escalate' | 'close', note?: string): Promise<CircuitEvent> {
+      return (await call('rpc/review_circuit_event', { method: 'POST', body: { p_id: id, p_action: action, p_note: note ?? null } })) as CircuitEvent;
+    },
+    async logAudit(e: { action: string; entity?: string; entity_id?: string; meta?: Record<string, unknown> }): Promise<void> {
+      await call('audit_log', { method: 'POST', body: [{ action: e.action, entity: e.entity ?? null, entity_id: e.entity_id ?? null, meta: e.meta ?? {} }], prefer: 'return=minimal' });
+    },
+    async listAudit(f: { action?: string; limit?: number; offset?: number } = {}): Promise<AuditRow[]> {
+      const q = [`select=seq,at,user_id,actor_role,action,entity,entity_id,meta,hash`, 'order=seq.desc', `limit=${f.limit ?? 200}`, `offset=${f.offset ?? 0}`, ...(f.action ? [`action=like.${enc(f.action.replace(/[^a-z_.*]/g, ''))}`] : [])];
+      const r = await call(`audit_log?${q.join('&')}`);
+      return Array.isArray(r) ? (r as AuditRow[]) : [];
+    },
+    async verifyAudit(): Promise<{ ok: boolean; checked: number; first_bad_seq: number | null }> {
+      const r = (await call('rpc/audit_verify', { method: 'POST', body: {} })) as { ok: boolean; checked: number; first_bad_seq: number | null }[] | null;
+      return r?.[0] ?? { ok: false, checked: 0, first_bad_seq: null };
+    },
+    async adminListUsers(): Promise<AdminUser[]> {
+      const r = await call('rpc/admin_list_users', { method: 'POST', body: {} });
+      return Array.isArray(r) ? (r as AdminUser[]) : [];
+    },
+    async setRole(target: string, role: AppRole): Promise<void> {
+      await call('rpc/set_user_role', { method: 'POST', body: { target, new_role: role } });
+    },
+    async listRules(): Promise<AlertRuleRow[]> {
+      const r = await call('alert_rules?select=id,symbol,kind,threshold,cooldown_min,channels,enabled,last_triggered_at,created_at&order=created_at.desc');
+      return Array.isArray(r) ? (r as AlertRuleRow[]) : [];
+    },
+    /** Creates a rule through /api/alerts/rules (server-side per-kind validation + readable errors). Only when that route is not deployed / unreachable does it fall back to PostgREST directly (RLS and the CHECK constraints still apply). */
+    async addRule(userId: string, r: { symbol: string; kind: RuleKind; threshold: number; cooldown_min: number; channels: { push: boolean; email: boolean } }): Promise<void> {
+      const t = await cfg.getToken();
+      if (t && typeof window !== 'undefined') {
+        let res: Response | null = null;
+        try { res = await f('/api/alerts/rules', { method: 'POST', headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' }, body: JSON.stringify(r) }); } catch { res = null; }
+        if (res && res.ok) return;
+        if (res && ![404, 501, 502, 503].includes(res.status)) {
+          const j = (await res.json().catch(() => ({}))) as { errors?: string[] };
+          throw new Error(`cloud ${res.status}: ${(j.errors ?? ['Could not save the rule.']).join(' ')}`);
+        }
+      }
+      await call('alert_rules', { method: 'POST', body: [{ user_id: userId, symbol: r.symbol.toUpperCase(), kind: r.kind, threshold: r.threshold, cooldown_min: r.cooldown_min, channels: r.channels }], prefer: 'return=minimal' });
+    },
+    /** edit threshold / cooldown / channels / enabled (symbol and kind are fixed) */
+    async updateRule(id: string, patch: { threshold?: number; cooldown_min?: number; channels?: { push: boolean; email: boolean }; enabled?: boolean }): Promise<void> {
+      const t = await cfg.getToken();
+      if (!t) throw new Error('not signed in');
+      const res = await f('/api/alerts/rules', { method: 'PATCH', headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ id, ...patch }) });
+      if (!res.ok) { const j = (await res.json().catch(() => ({}))) as { errors?: string[] }; throw new Error(`cloud ${res.status}: ${(j.errors ?? ['Could not update the rule.']).join(' ')}`); }
+    },
+    /** volume baselines the daemon computed (N/A reasons for volume_surge rules); [] before docs/WEEK9_TURN43_SCHEMA.sql */
+    async listBaselines(symbols: string[]): Promise<VolumeBaselineRow[]> {
+      const list = [...new Set(symbols.map((x) => x.toUpperCase()))].filter((x) => /^[A-Z0-9&._-]{1,24}$/.test(x));
+      if (!list.length) return [];
+      const r = await call(`volume_baselines?symbol=in.${enc(inList(list))}&select=symbol,median_volume,sessions,status,computed_at`).catch(() => []);
+      return Array.isArray(r) ? (r as VolumeBaselineRow[]) : [];
+    },
+    /** heartbeat of the closed-app alert daemon (null = none seen, or the migration is not applied) */
+    async daemonHealth(): Promise<DaemonBeat | null> {
+      const r = await call('rpc/daemon_health', { method: 'POST', body: {} }).catch(() => null);
+      return Array.isArray(r) && r[0] ? (r[0] as DaemonBeat) : null;
+    },
+    /** the user's Quiet Hours (null = none saved, or the migration is not applied) */
+    async getQuietHours(): Promise<QuietHours | null> {
+      const r = await call('user_quiet_hours?select=enabled,start_min,end_min,tz&limit=1').catch(() => null);
+      return Array.isArray(r) && r[0] ? sanitizeQuiet(r[0]) : null;
+    },
+    async setQuietHours(userId: string, q: QuietHours): Promise<void> {
+      const errs = validateQuiet(q);
+      if (errs.length) throw new Error(errs.join(' '));
+      await call('user_quiet_hours?on_conflict=user_id', { method: 'POST', body: [{ user_id: userId, enabled: q.enabled, start_min: q.start, end_min: q.end, tz: q.tz }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+    /** recent heuristic depth flags written by the daemon ([] before docs/WEEK9_TURN44_SCHEMA.sql) */
+    async listDepthFlags(limit = 30): Promise<DepthFlagRow[]> {
+      const r = await call(`depth_flags?select=id,symbol,kind,side,severity,price,qty,detail,label,flagged_at&order=flagged_at.desc&limit=${Math.min(100, Math.max(1, limit))}`).catch(() => []);
+      return Array.isArray(r) ? (r as DepthFlagRow[]) : [];
+    },
+    async setRuleEnabled(id: string, enabled: boolean): Promise<void> {
+      await call(`alert_rules?id=eq.${encodeURIComponent(id)}`, { method: 'PATCH', body: { enabled }, prefer: 'return=minimal' });
+    },
+    async deleteRule(id: string): Promise<void> {
+      await call(`alert_rules?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', prefer: 'return=minimal' });
+    },
+    async listDeliveries(limit = 50): Promise<AlertDelivery[]> {
+      const q = (cols: string) => `alert_deliveries?select=${cols}&order=fired_at.desc&limit=${limit}`;
+      // the latency columns exist only after docs/WEEK9_SCHEMA.sql — fall back to the original columns before that migration
+      const r = await call(q(`${DELIVERY_COLS},${DELIVERY_LATENCY_COLS}`)).catch(() => call(q(DELIVERY_COLS)));
+      return Array.isArray(r) ? (r as AlertDelivery[]) : [];
+    },
+    async getDelivery(id: string): Promise<AlertDelivery | null> {
+      const r = await call(`alert_deliveries?id=eq.${encodeURIComponent(id)}&select=${DELIVERY_COLS},${DELIVERY_LATENCY_COLS}&limit=1`);
+      return Array.isArray(r) && r[0] ? (r[0] as AlertDelivery) : null;
+    },
+    async signOffAi(x: { kind: 'postmortem' | 'copilot' | 'report'; symbol?: string; model: string; promptVersion: string; dataUsed: string[]; outputHash: string; decision: 'approved' | 'rejected'; note?: string }): Promise<string> {
+      return (await call('rpc/sign_off_ai_output', { method: 'POST', body: { p_kind: x.kind, p_symbol: x.symbol ?? '', p_model: x.model, p_prompt_version: x.promptVersion, p_data_used: x.dataUsed, p_output_hash: x.outputHash, p_decision: x.decision, p_note: x.note ?? null } })) as string;
+    },
+    async listSignoffs(limit = 100): Promise<AiSignoff[]> {
+      const r = await call(`ai_signoffs?select=id,kind,symbol,model,prompt_version,data_used,output_hash,decision,note,signer_role,signed_at&order=signed_at.desc&limit=${limit}`);
+      return Array.isArray(r) ? (r as AiSignoff[]) : [];
+    },
+    /** DPDP access / portability: everything stored about the caller, as JSON */
+    async exportMyData(): Promise<Record<string, unknown>> {
+      return (await call('rpc/export_my_data', { method: 'POST', body: {} })) as Record<string, unknown>;
+    },
+    async loadLayouts(userId: string): Promise<unknown> {
+      return ((await call(`preferences?${uid(userId)}&select=layouts`)) as { layouts?: unknown }[] | null)?.[0]?.layouts ?? null;
+    },
+    async saveLayouts(userId: string, layouts: unknown): Promise<void> {
+      await call('preferences?on_conflict=user_id', { method: 'POST', body: [{ user_id: userId, layouts, updated_at: new Date().toISOString() }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+    async loadRiskSettings(userId: string): Promise<{ limits: unknown; report: boolean }> {
+      const r = ((await call(`preferences?${uid(userId)}&select=risk_limits,risk_report`)) as { risk_limits?: unknown; risk_report?: boolean }[] | null)?.[0];
+      return { limits: r?.risk_limits ?? null, report: !!r?.risk_report };
+    },
+    async saveRiskSettings(userId: string, s: { limits?: unknown; report?: boolean }): Promise<void> {
+      await call('preferences?on_conflict=user_id', { method: 'POST', body: [{ user_id: userId, ...(s.limits !== undefined ? { risk_limits: s.limits } : {}), ...(s.report !== undefined ? { risk_report: s.report } : {}), updated_at: new Date().toISOString() }], prefer: 'resolution=merge-duplicates,return=minimal' });
+    },
+  };
+}
