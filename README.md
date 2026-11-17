@@ -1,69 +1,143 @@
-# Realtime Stock Market Analytics
+# UpCircuit — Real-Time Stock Market Analytics & Surveillance Platform for Indian Equities
 
-A real-time data streaming pipeline designed to ingest stock market trades, detect high-volatility events, and trigger automated circuit-breaker alerts.
+**M.Sc. Data Science Capstone Project · Chanakya University**
+Rishav Singh & Pratima Bastola
 
-## Project Contributors
-* Rishav Singh
-* Pratima Bastola
+| | |
+|---|---|
+| Web app | https://upcircuit.vercel.app |
+| Alert daemon | https://upcircuit-daemon.onrender.com (`/healthz`) |
 
-*Both contributors work collaboratively across the entire stack: system design, Kafka streaming, PostgreSQL data modeling, and visualization.*
+UpCircuit streams NSE equity data, charts it, and watches it. A Next.js terminal serves retail traders, analysts and risk/compliance staff; a separate always-on daemon evaluates alert rules against the live tick stream and pushes to closed-app phones. Everything shown is either live data or labelled **N/A** — values are never invented.
 
----
-
-## 🛠️ Tech Stack
-* **Language:** Python 3.10+
-* **Visualization & Analytics:** Streamlit, Plotly, Pandas
-* **Message Broker (Planned):** Apache Kafka
-* **Storage (Planned):** PostgreSQL
-* **Version Control:** Git, GitHub
+> **Not investment advice.** Heuristic flags, AI output and backtest numbers are screening aids. See [Compliance & limits](#compliance--limits).
 
 ---
 
-## 🚀 Milestones Completed
+## Architecture
 
-### Week 1 Milestones Completed
-* Collaboratively designed the end-to-end streaming architecture.
-* Researched circuit-breaker logic parameters and thresholds.
-* Finalized initial PostgreSQL schema (`schema.sql`) for trade ingestion and alert logging.
-
-### Week 2 Milestones Completed
-* Built a continuous tick simulator (`week2/nifty50_simulator.py`) generating live trade ticks (~2.5 ticks/sec) across 10 major NIFTY 50 equities.
-* Implemented in-stream percentage drift evaluation to trigger automated circuit-breaker alerts when price moves reach or exceed ±5%.
-* Developed an interactive dashboard (`week2/dashboard.py`) using Streamlit and Plotly with dynamic OHLC candlestick resampling (2s to 30s) and transaction volume bars.
-* Verified and documented execution runs locally via terminal and visualizer.
-
----
-
-## 🏗️ Proposed System Pipeline (Under Research)
-
-```mermaid
-flowchart TD
-    A["Mock / Live Market Feed (Python Generator)"] -->|Streaming JSON Ticks| B["Message Broker (Apache Kafka: 'stock-ticks')"]
-    B -->|Subscribe & Stream| C["Stream Processing Engine (Python Volatility Tracker)"]
-    C -->|Breach Threshold Detected| D["Alerting Engine (Circuit Breaker Log / Console)"]
-    C -->|Persist Trade Data| E[("Relational Database (PostgreSQL)")]
-    D -->|Log Trigger Events| E
-    E -->|Read Query / Aggregate| F["Analytics Dashboard (PowerBI / Streamlit)"]
+```
+ Angel One SmartAPI WebSocket (binary) ──► Next.js 14 app (Vercel)  ──► Supabase (Auth · Postgres + RLS · Realtime)
+        │  Yahoo Finance fallback            Terminal · Discovery Hub · Compliance        ▲   ▲
+        │                                                                                │   │ Realtime (alert_rules) + 5-min resync
+        └──────────────► Alert daemon (Docker, Render) ── claim_alert_rule ──────────────┘   │
+                          rule engine · lease HA · quiet hours                               │
+                          │                                                                  │
+                          ├─► Web Push (VAPID) ─► desktop / Android / iOS PWA ─► Service Worker ACK ─► /api/alerts/ack
+                          └─► Resend e-mail
 ```
 
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS, TradingView **Lightweight Charts** |
+| Data & auth | Supabase — Auth, PostgreSQL, Row-Level Security, Realtime |
+| Live market data | Angel One **SmartAPI** WebSocket binary stream; Yahoo Finance fallback |
+| Alert daemon | Node/TypeScript (`tsx`), containerised (`daemon/Dockerfile`), deployed on Render |
+| Notifications | PWA (`app/manifest.ts` + `public/manifest.json`), multi-device VAPID Web Push, Service Worker ACK tracking, Resend transactional e-mail |
+| Client libs | `jspdf`, `pdfjs-dist`, `tesseract.js`, `vader-sentiment`, `lucide-react`, `next-themes` |
+
+## Key features
+
+### Surveillance Desk (Compliance workspace)
+- **Feed Health** monitor — feed state, last-tick age, daemon heartbeat (ages use the database clock, so browser skew cannot fake "stale").
+- **Order Book Imbalance gauge** — exponentially level-weighted top-5 depth, `w_i = e^(−λ(i−1))`, λ = 0.5 (`lib/depthImbalance.ts`). Display only; alert rules use the raw ratio.
+- **Intraday volume baseline** — 25 buckets of 15 minutes, median cumulative curve over completed sessions (≥ 10 required, 2 % floor, full-day fallback) (`lib/volumeBaseline.ts`).
+- **Resting-order wall** and **rapid add/cancel** flags, always labelled *Heuristic Flag / Possible Manipulation Pattern* (enforced by a DB `CHECK`).
+- **Heuristic backtest card** — deterministic run over 539,972 synthetic snapshots: 13.3 % precision, 100.0 % `spoof_wall` recall, 95.2 % `flicker` recall (`public/backtest-heuristics.json`). Labels come from the generator, so these figures describe the assumed noise model, **not** real-market manipulation.
+- **Live Alert Deliveries** latency log: tick → daemon match → push accepted → service-worker ACK → displayed.
+- Circuit-breaker register with audit hash chain, review workflow and RBAC (viewer / analyst / risk / compliance / admin).
+
+### High-availability alert daemon (`daemon/`)
+- **PostgreSQL lease election** — one leader, others stand by with a warm rule index (`daemon/lease.ts`, `acquire_daemon_lease`, DB-clock TTL, monotonic fencing `epoch`).
+- SmartAPI ingestion → in-memory rule index → **rising-edge** crossing with cooldown; `claim_alert_rule(rule, window)` makes dispatch idempotent across daemons and the cron backstop.
+- Rule kinds: `price_above/below`, `pct_up/down`, `circuit_proximity`, `volume_surge`, `order_imbalance_above/below`.
+- **Timezone-aware quiet hours** (`user_quiet_hours`, IANA zone).
+- **Multi-device fan-out** — VAPID Web Push to every registered desktop/Android/iOS-PWA device, plus Resend e-mail.
+
+### Terminal & Discovery Hub (cross-device)
+- Candlestick chart defaulting to **1D**; timeframes and indicators (EMA20, EMA50, VWAP, RSI) synced through Supabase (`preferences.ui`, newest-write-wins; defaults never overwrite saved choices).
+- Persistent **MY FOCUS** basket (local + account, loaded before any starter seeding).
+- Persona dashboards: **Retail Investor, Day Trader, Institutional Analyst, Executive / Risk Manager**.
+- Portfolio import by **OCR / PDF / CSV**; watchlists, price alerts, PDF export.
+- **Ask UpCircuit** AI copilot (Gemini) with human sign-off trail.
+- Settings → *Cloud & Data* shows sync status and last-saved time; *Alert Channels* lists devices with Remove and a mobile setup guide.
+
+### Compliance & limits
+- Mandatory **SEBI risk / self-responsibility disclosure** modal on every fresh session or login (`components/RegulatoryDisclosureModal.tsx`, `lib/disclosure.ts`); acknowledgement timestamp stored in auth user metadata as an audit trail.
+- Heuristic flags are never proof; the backtest is synthetic; AI output requires explicit sign-off (`ai_signoffs`).
+- DPDP Act 2023 helpers: `export_my_data()`, `delete_my_data()` (+ `/api/account/delete`).
+
 ---
 
-## 📚 Academic References & Theoretical Foundations
+## Repository map
 
-This project grounds its real-time streaming architecture and risk mechanics in established academic literature:
+| Path | Contents |
+|---|---|
+| `app/` | Routes (`/`, `/terminal`, `/login`, `/settings`, `/status`, `/legal`), `app/api/*` (alerts, quotes, bars, market, copilot, ask, worker …), `manifest.ts` |
+| `components/` | UI; `dashboards/` (personas, Surveillance workspace), `settings/` |
+| `lib/` | Engines and shared logic (alerts, depth imbalance, volume baseline, cloud sync, disclosure …) |
+| `daemon/` | Alert daemon: `index.ts`, `engine.ts`, `dispatcher.ts`, `lease.ts`, `baselines.ts`, `Dockerfile` |
+| `scripts/` | Verification, RLS test, backtest, benchmark, instrument sync, daemon smoke test |
+| `tests/` | `week10.test.ts`, `fixes.test.ts`, `week11.test.ts` (node:test) |
+| `docs/` | Runbook, deployment, threat model, daemon notes, per-week SQL history |
+| `schema.sql` | **Consolidated, idempotent production schema** (use this for new projects) |
+| `public/` | `manifest.json`, icons, `sw.js`, `backtest-heuristics.json` |
 
-1. **Distributed Event Streaming:**
-   * Kreps, J., Narkhede, N., & Rao, J. (2011). ["Kafka: A Distributed Messaging System for Log Processing."](https://netdb.csc.ncsu.edu/netdb11/papers/netdb11-final12.pdf) *Proceedings of the 6th International Workshop on Networking Meets Databases (NetDB)*.
-   * *Focus:* High-throughput, log-structured message brokers using sequential disk I/O and zero-copy transfers (`sendfile`) to decouple tick ingestion from downstream analytical consumers.
+---
 
-2. **In-Stream Processing & Complex Event Evaluation:**
-   * Wu, E., Diao, Y., & Rizvi, S. (2006). ["High-Performance Complex Event Processing over Streams."](https://cs.brown.edu/courses/cs295-11/2007/complex.pdf) *Proceedings of the 2006 ACM SIGMOD International Conference on Management of Data*.
-   * *Focus:* Finite automata evaluation over sliding time windows to process complex event patterns in active memory, validating our decision to evaluate circuit-breaker thresholds in-stream before storage.
+## Setup
 
-3. **Market Microstructure & Trading Halts:**
-   * Subrahmanyam, A. (1994). ["Circuit Breakers and Market Volatility: A Theoretical Perspective."](https://ideas.repec.org/a/bla/jfinan/v49y1994i1p237-54.html) *The Journal of Finance, 49(1), pp. 237–254*.
-   * *Focus:* Theoretical modeling of the "magnet effect"—traders advancing orders as price bands near, which can increase price variability. Informs our understanding that a fixed ±5% tripwire is an engineering testing heuristic rather than a full model of real-world trading behavior.
+Requires Node 20+ (the daemon image uses Node 22) and a Supabase project.
 
-4. **Real-Time Stream Engine Architecture:**
-   * Stonebraker, M., Çetintemel, U., & Zdonik, S. (2005). ["The 8 Requirements of Real-Time Stream Processing."](https://cs.brown.edu/people/ugur/8rulesSigRec.pdf) *ACM SIGMOD Record, 34(4), pp. 42–47*.
-   * *Focus:* Emphasizes Rule 1 ("Keep the data moving" without waiting for static database writes), justifying our pipeline design to keep PostgreSQL off the critical real-time alert evaluation path.
+```bash
+git clone https://github.com/srishav1000-cyber/UpCircuit.git && cd UpCircuit
+npm i
+cp .env.example .env.local        # fill in values — never commit real keys
+npm run sync:instruments          # download the NSE/Angel instrument master
+npm run dev                       # http://localhost:3000
+```
+
+### Database
+Open the Supabase SQL editor and run **`schema.sql`** once. It is idempotent (safe to re-run) and includes tables, indexes, RLS policies, grants, `SECURITY DEFINER` RPCs, the final function privilege allow-list and the Realtime publication for `alert_rules`. It supersedes the files in `docs/*.sql`, which are kept as history. To make yourself the first admin, follow the bootstrap comment at the top of `schema.sql`.
+
+### Environment variables
+Names only — see `.env.example` for comments. Server-only secrets must never use the `NEXT_PUBLIC_` prefix.
+
+| Group | Variables |
+|---|---|
+| Supabase | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` (server only), `NEXT_PUBLIC_AUTH_REQUIRED`, `NEXT_PUBLIC_APP_URL` |
+| SmartAPI | `SMARTAPI_API_KEY`, `SMARTAPI_CLIENT_CODE`, `SMARTAPI_PASSWORD`, `SMARTAPI_TOTP_SECRET`, `NEXT_PUBLIC_SMARTAPI_API_KEY`, `SMARTAPI_SESSION_PUBLIC` |
+| Web Push | `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`, `PUSH_ENDPOINT_ALLOW`, `ALERT_ACK_SECRET` |
+| E-mail | `RESEND_API_KEY`, `EMAIL_FROM` |
+| AI / news | `GEMINI_API_KEY`, `GEMINI_MODEL`, `NEWS_RSS_URLS` |
+| Instruments | `ANGEL_SCRIP_MASTER_URL`, `NSE_EQUITY_CSV_URL` |
+| Ops | `CRON_SECRET`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `SENTRY_DSN`, `LOG_LEVEL`, `CSP_CONNECT_EXTRA` |
+| Daemon | `PORT`, `DAEMON_HA`, `DAEMON_LEASE_NAME`, `DAEMON_LEASE_TTL_S`, `DAEMON_LEASE_RENEW_MS`, `DAEMON_RESYNC_MS`, `DAEMON_STALL_MS`, `DAEMON_MAX_BACKOFF_MS` |
+
+`ALERT_ACK_SECRET` must be identical on Vercel and the daemon (otherwise it is derived from `VAPID_PRIVATE_KEY`, which must then match).
+
+### Alert daemon (Docker)
+Build from the repo root; supply configuration at run time, not in the image.
+
+```bash
+docker build -f daemon/Dockerfile -t upcircuit-daemon .
+docker run -d --name upcircuit-daemon -p 8080:8080 --env-file .env.daemon upcircuit-daemon
+curl http://localhost:8080/healthz
+```
+Without Docker: `npm run daemon`. On Render, deploy as a Docker web service from `daemon/Dockerfile`. Run two instances for HA — the lease keeps one active. Details: `docs/WEEK9_DAEMON.md`, `docs/RUNBOOK.md`.
+
+## Verification
+
+```bash
+npm test                              # verify.ts + verify-auth.ts + tests/week10 · fixes · week11
+npm run typecheck                     # tsc --noEmit
+npx tsx scripts/backtest-heuristics.ts   # regenerate the synthetic heuristic backtest
+npm run daemon:smoke                  # daemon vs local mock feed / Supabase / push service
+bash scripts/rls-test.sh              # RLS + RPC assertions on a throw-away local PostgreSQL (needs server binaries)
+RLS_SCHEMA_MODE=consolidated bash scripts/rls-test.sh   # same assertions against schema.sql, applied twice
+npm run build                         # production build
+```
+Benchmarks (`npm run bench`) and the daemon smoke test use local mocks; they do not measure real SmartAPI or push-service latency.
+
+## License & disclaimer
+Academic capstone project. Market data is provided as-is and may be delayed or unavailable; nothing here is a recommendation to buy or sell any security.
